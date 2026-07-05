@@ -3,12 +3,20 @@ import { useState } from "react";
 import { addDoc, collection, doc, updateDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/context/AuthContext";
-import { usePatientData } from "@/context/PatientDataContext";
+import { usePatientData, type LabRequest } from "@/context/PatientDataContext";
 import { RoleGuard, RoleHeader, FlowTracker, StatCard, Tabs, Empty, Spinner, Field, inputCls, useToast, isToday, priorityBadge, statusBadge } from "@/components/his/shared";
 
 export const Route = createFileRoute("/dashboard/lab")({ component: () => <RoleGuard role="LabTechnician"><Dashboard /></RoleGuard> });
 
 type Tab = "queue" | "upload" | "history";
+
+function isLabRequestPending(request: LabRequest) {
+  return request.status !== "Completed" && request.status !== "completed" && request.lab_status !== "completed" && !request.results_received;
+}
+
+function isLabRequestCompleted(request: LabRequest) {
+  return request.status === "Completed" || request.lab_status === "completed" || request.results_received === true;
+}
 
 function Dashboard() {
   const { staff } = useAuth();
@@ -17,8 +25,9 @@ function Dashboard() {
   const [tab, setTab] = useState<Tab>("queue");
   const [activeReq, setActiveReq] = useState<string | null>(null);
 
-  const pending = labRequests.filter((r) => r.status === "Pending");
-  const inProgress = labRequests.filter((r) => r.status === "In Progress");
+  const pending = labRequests.filter((r) => isLabRequestPending(r) && r.status !== "In Progress");
+  const inProgress = labRequests.filter((r) => r.status === "In Progress" || r.lab_status === "in-progress");
+  const pendingRequests = [...pending, ...inProgress];
   const completedToday = labResults.filter((r) => isToday(r.uploaded_at)).length;
 
   return (
@@ -33,11 +42,11 @@ function Dashboard() {
         <Tabs accent="bg-orange-600" current={tab} onChange={(id) => setTab(id as Tab)} tabs={[{ id: "queue", label: "Lab Requests" }, { id: "upload", label: "Upload Results" }, { id: "history", label: "Results History" }]} />
         <div className="rounded-lg border bg-card p-4 shadow-sm">
           {tab === "queue" ? (
-            !pending.length && !inProgress.length ? <Empty /> : (
+            !pendingRequests.length ? <Empty /> : (
               <table className="w-full text-sm">
                 <thead className="bg-muted/40 text-left text-xs uppercase text-muted-foreground"><tr><th className="px-3 py-2">Lab ID</th><th className="px-3 py-2">Patient</th><th className="px-3 py-2">Test</th><th className="px-3 py-2">Requested By</th><th className="px-3 py-2">Priority</th><th className="px-3 py-2">Time</th><th className="px-3 py-2">Status</th><th className="px-3 py-2"></th></tr></thead>
                 <tbody>
-                  {[...pending, ...inProgress].map((r) => {
+                  {pendingRequests.map((r) => {
                     const p = patients.find((x) => x.id === r.patient_id);
                     const tr = triageRecords.find((t) => t.visit_id === r.visit_id);
                     return (
@@ -51,7 +60,7 @@ function Dashboard() {
                         <td className="px-3 py-2">{r.status}</td>
                         <td className="px-3 py-2">
                           <button onClick={async () => {
-                            await updateDoc(doc(db, "lab_requests", r.id), { status: "In Progress" });
+                            await updateDoc(doc(db, "lab_requests", r.id), { status: "In Progress", lab_status: "in-progress", results_received: false });
                             setActiveReq(r.id); setTab("upload");
                           }} className="rounded-md bg-orange-600 px-3 py-1 text-xs font-medium text-white hover:bg-orange-700">Process Test</button>
                         </td>
@@ -79,7 +88,7 @@ function Dashboard() {
     const [saving, setSaving] = useState(false);
 
     if (!req || !patient) {
-      const choices = labRequests.filter((r) => r.status === "In Progress" || r.status === "Pending");
+      const choices = labRequests.filter((r) => r.status === "In Progress" || r.status === "Pending" || r.lab_status === "in-progress" || r.lab_status === "pending" || r.results_received === false);
       return (
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">Pick a lab request:</p>
@@ -109,11 +118,17 @@ function Dashboard() {
           uploaded_by: staff!.staff_id,
           uploaded_at: new Date().toISOString(),
         });
-        await updateDoc(doc(db, "lab_requests", req.id), { status: "Completed" });
-        const others = labRequests.filter((r) => r.visit_id === req.visit_id && r.id !== req.id);
-        const allDone = others.every((r) => r.status === "Completed");
+        await updateDoc(doc(db, "lab_requests", req.id), {
+          status: "Completed",
+          lab_status: "completed",
+          results_received: true,
+          result_details: form.result_details,
+          result_status: form.result_status,
+        });
+        const visitLabRequests = labRequests.filter((r) => r.visit_id === req.visit_id && r.id !== req.id);
+        const allDone = [...visitLabRequests, { ...req, status: "Completed", lab_status: "completed", results_received: true }].every((r) => isLabRequestCompleted(r));
         if (allDone) {
-          await updateDoc(doc(db, "visits", req.visit_id), { status: "Waiting for Consultation", lab_returned_at: new Date().toISOString() });
+          await updateDoc(doc(db, "visits", req.visit_id), { status: "Waiting for Pharmacy", lab_returned_at: new Date().toISOString() });
         }
         setSaving(false);
         toast.success("Results uploaded" + (allDone ? " — patient returned to clinician review" : ""));

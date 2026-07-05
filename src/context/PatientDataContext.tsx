@@ -78,6 +78,10 @@ export interface LabRequest {
   consultation_id: string | null;
   test_type: string;
   status: string;
+  lab_status?: string;
+  results_received?: boolean;
+  result_details?: string | null;
+  result_status?: string | null;
   requested_by: string;
   requested_at: string;
 }

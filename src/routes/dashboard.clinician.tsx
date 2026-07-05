@@ -1,10 +1,10 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
-import { collection, doc, updateDoc, writeBatch } from "firebase/firestore";
+import { collection, doc, setDoc, updateDoc, writeBatch } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { buildDailyReportSummary, canProceedToService, matchInventoryItem, nextCode } from "@/lib/firestore-helpers";
 import { useAuth } from "@/context/AuthContext";
-import { usePatientData, type Payment } from "@/context/PatientDataContext";
+import { usePatientData, type LabRequest, type Payment } from "@/context/PatientDataContext";
 import { RoleGuard, RoleHeader, FlowTracker, StatCard, Tabs, Empty, Spinner, Field, inputCls, useToast, isToday, ageFromDob, priorityBadge, statusBadge } from "@/components/his/shared";
 import { Plus, X, Download } from "lucide-react";
 
@@ -25,6 +25,14 @@ type Tab = "queue" | "consultation" | "results" | "prescriptions";
 const LAB_TESTS = ["Full Blood Count","Malaria RDT","Urinalysis","Blood Glucose","Liver Function Test","Renal Function Test","HIV Test","Pregnancy Test","Stool Analysis","Sputum Culture","Other"];
 const FREQS = ["Once Daily","Twice Daily","Three Times Daily","As Needed"];
 
+function isLabRequestPending(request: LabRequest) {
+  return request.status !== "Completed" && request.status !== "completed" && request.lab_status !== "completed" && !request.results_received;
+}
+
+function isLabRequestCompleted(request: LabRequest) {
+  return request.status === "Completed" || request.lab_status === "completed" || request.results_received === true;
+}
+
 function Dashboard() {
   const { staff } = useAuth();
   const { patients, visits, triageRecords, payments, consultations, labRequests, labResults, prescriptions, inventory } = usePatientData();
@@ -39,7 +47,9 @@ function Dashboard() {
     return canProceedToService(payment, patient?.insurance_number);
   }), [patients, payments, visits]);
   const consultationsToday = consultations.filter((c) => isToday(c.consulted_at) && c.consulted_by === staff?.staff_id).length;
-  const pendingLab = labRequests.filter((r) => r.status !== "Completed" && r.requested_by === staff?.staff_id).length;
+  const myLabRequestIds = useMemo(() => new Set(labRequests.filter((r) => r.requested_by === staff?.staff_id).map((r) => r.id)), [labRequests, staff?.staff_id]);
+  const resultsToReview = labResults.filter((r) => myLabRequestIds.has(r.lab_request_id)).length;
+  const pendingLab = labRequests.filter((r) => isLabRequestPending(r) && r.requested_by === staff?.staff_id).length;
 
   const downloadDailyReport = () => {
     const date = new Date().toISOString().slice(0, 10);
@@ -73,15 +83,15 @@ function Dashboard() {
         <FlowTracker />
         <div className="grid gap-3 sm:grid-cols-3">
           <StatCard label="Waiting for Consultation" value={queue.length} tone="warn" />
-          <StatCard label="Consultations Today" value={consultationsToday} tone="ok" />
-          <StatCard label="Pending Lab Results" value={pendingLab} />
+          <StatCard label="Results to Review" value={resultsToReview} tone="ok" />
+          <StatCard label="Consultations Today" value={consultationsToday} />
         </div>
         <div className="flex justify-end">
           <button onClick={downloadDailyReport} className="flex items-center gap-2 rounded-md border bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
             <Download className="size-4" /> Download Daily Report
           </button>
         </div>
-        <Tabs accent="bg-violet-600" current={tab} onChange={(id) => setTab(id as Tab)} tabs={[{ id: "queue", label: "Patient Queue" }, { id: "consultation", label: "Consultation" }, { id: "results", label: "Lab Results" }, { id: "prescriptions", label: "Prescriptions Issued" }]} />
+        <Tabs accent="bg-violet-600" current={tab} onChange={(id) => setTab(id as Tab)} tabs={[{ id: "queue", label: "Patient Queue" }, { id: "consultation", label: "Results Review" }, { id: "results", label: "Lab Results" }, { id: "prescriptions", label: "Prescriptions Issued" }]} />
         <div className="rounded-lg border bg-card p-4 shadow-sm">
           {tab === "queue" ? (
             !queue.length ? <Empty /> : (
@@ -134,17 +144,25 @@ function Dashboard() {
       const reqIds = new Set(visitLabRequests.map((r) => r.id));
       return labResults.filter((r) => reqIds.has(r.lab_request_id));
     }, [labResults, visitLabRequests]);
+    const reviewableVisits = useMemo(() => visits.filter((v) => {
+      if (v.status !== "In Consultation" && v.status !== "Waiting for Pharmacy") return false;
+      const consultation = consultations.find((c) => c.visit_id === v.id);
+      return !!consultation || v.status === "Waiting for Pharmacy";
+    }), [consultations, visits]);
     const reviewMode = !!(visit?.lab_returned_at && existingConsultation);
+    const hasCompletedLabResults = visitLabResults.length > 0 || visitLabRequests.some((request) => isLabRequestCompleted(request));
+    const hasPendingLabRequest = visitLabRequests.some((request) => isLabRequestPending(request));
+    const canPrescribe = !hasPendingLabRequest || hasCompletedLabResults;
 
     const [form, setForm] = useState({ presenting_complaint: "", history_of_presenting_illness: "", examination_findings: "", diagnosis: "", treatment_plan: "" });
     const [errs, setErrs] = useState<Record<string, boolean>>({});
     const [tests, setTests] = useState<string[]>([]);
     const [testPick, setTestPick] = useState("");
+    const [requestedLabTests, setRequestedLabTests] = useState<string[]>([]);
+    const [requestingLabTest, setRequestingLabTest] = useState(false);
     const [meds, setMeds] = useState<{ medicationName: string; dosage: string; frequency: string; duration: string; instructions: string }[]>([]);
     const [med, setMed] = useState({ medicationName: "", dosage: "", frequency: "Once Daily", duration: "", instructions: "" });
     const [saving, setSaving] = useState(false);
-
-    const inConsultation = visits.filter((v) => v.status === "In Consultation");
 
     if (!visit || !patient) {
       return (
@@ -152,11 +170,55 @@ function Dashboard() {
           <p className="text-sm text-muted-foreground">Select an active consultation:</p>
           <select value={visitId} onChange={(e) => { setVisitId(e.target.value); setActiveVisitId(e.target.value); }} className={inputCls()}>
             <option value="">— Select —</option>
-            {inConsultation.map((v) => { const p = patients.find((x) => x.id === v.patient_id); return p ? <option key={v.id} value={v.id}>{p.patient_code} — {p.first_name} {p.last_name}</option> : null; })}
+            {reviewableVisits.map((v) => { const p = patients.find((x) => x.id === v.patient_id); return p ? <option key={v.id} value={v.id}>{p.patient_code} — {p.first_name} {p.last_name}</option> : null; })}
           </select>
         </div>
       );
     }
+
+    const requestLabTest = async () => {
+      if (!testPick) {
+        toast.error("Select a lab test first");
+        return;
+      }
+      if (!serviceCleared) {
+        toast.error("Lab requests remain locked until payment is cleared or insurance is validated.");
+        return;
+      }
+      const alreadyRequested = labRequests.some((request) => request.visit_id === visit.id && request.test_type === testPick && isLabRequestPending(request));
+      if (alreadyRequested) {
+        toast.error(`${testPick} is already queued for this visit`);
+        return;
+      }
+      setRequestingLabTest(true);
+      try {
+        const lab_code = await nextCode("LAB", "lab_requests");
+        const requestRef = doc(collection(db, "lab_requests"));
+        const now = new Date().toISOString();
+        await setDoc(requestRef, {
+          lab_code,
+          patient_id: patient.id,
+          visit_id: visit.id,
+          consultation_id: existingConsultation?.id ?? null,
+          test_type: testPick,
+          status: "Pending",
+          lab_status: "pending",
+          results_received: false,
+          result_details: null,
+          result_status: null,
+          requested_by: staff!.staff_id,
+          requested_at: now,
+        });
+        setTests((prev) => (prev.includes(testPick) ? prev : [...prev, testPick]));
+        setRequestedLabTests((prev) => (prev.includes(testPick) ? prev : [...prev, testPick]));
+        setTestPick("");
+        toast.success(`${testPick} sent to the lab queue`);
+      } catch (err: unknown) {
+        toast.error((err as Error).message ?? "Lab request failed");
+      } finally {
+        setRequestingLabTest(false);
+      }
+    };
 
     const submit = async (e: React.FormEvent) => {
       e.preventDefault();
@@ -184,8 +246,9 @@ function Dashboard() {
 
         const inventoryAdjustments = new Map<string, number>();
 
-        if (!reviewMode && tests.length) {
-          for (const t of tests) {
+        const pendingLabTestsToSave = tests.filter((test) => !requestedLabTests.includes(test));
+        if (!reviewMode && pendingLabTestsToSave.length) {
+          for (const t of pendingLabTestsToSave) {
             const lab_code = await nextCode("LAB", "lab_requests");
             const labRef = doc(collection(db, "lab_requests"));
             batch.set(labRef, {
@@ -195,13 +258,22 @@ function Dashboard() {
               consultation_id: consRef.id,
               test_type: t,
               status: "Pending",
+              lab_status: "pending",
+              results_received: false,
+              result_details: null,
+              result_status: null,
               requested_by: staff!.staff_id,
               requested_at: now,
             });
           }
         }
 
-        if ((reviewMode || tests.length === 0) && meds.length) {
+        const orphanLabRequests = labRequests.filter((r) => r.visit_id === visit.id && !r.consultation_id);
+        for (const request of orphanLabRequests) {
+          batch.update(doc(db, "lab_requests", request.id), { consultation_id: consRef.id });
+        }
+
+        if ((reviewMode || tests.length === 0) && meds.length && (reviewMode || canPrescribe)) {
           const rx_code = await nextCode("RX", "prescriptions");
           const rxRef = doc(collection(db, "prescriptions"));
           batch.set(rxRef, {
@@ -230,7 +302,7 @@ function Dashboard() {
           }
         }
 
-        const nextStatus = reviewMode ? "Waiting for Pharmacy" : tests.length ? "In Lab" : "Waiting for Pharmacy";
+       const nextStatus = reviewMode ? "Waiting for Pharmacy" : tests.length ? "In Lab" : "Waiting for Pharmacy";
         batch.update(doc(db, "visits", visit.id), reviewMode ? { status: nextStatus, lab_returned_at: null } : { status: nextStatus });
         await batch.commit();
         setSaving(false);
@@ -302,12 +374,13 @@ function Dashboard() {
           <div className="rounded-md border bg-muted/30 p-3">
             <div className="mb-2 font-semibold text-sm">Laboratory Requests</div>
             {!serviceCleared ? <p className="mb-2 text-xs text-amber-700">Lab requests remain locked until payment is cleared or insurance is validated.</p> : null}
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <select className={inputCls()} value={testPick} onChange={(e) => setTestPick(e.target.value)}>
                 <option value="">Select test…</option>
                 {LAB_TESTS.map((t) => <option key={t}>{t}</option>)}
               </select>
-              <button type="button" disabled={!serviceCleared} onClick={() => { if (testPick) { setTests((p) => [...p, testPick]); setTestPick(""); } }} className="flex items-center gap-1 rounded-md bg-violet-600 px-3 py-2 text-sm text-white hover:bg-violet-700 disabled:opacity-50"><Plus className="size-4" /> Add</button>
+              <button type="button" disabled={!serviceCleared} onClick={() => { if (testPick) { setTests((p) => (p.includes(testPick) ? p : [...p, testPick])); setTestPick(""); } }} className="flex items-center gap-1 rounded-md bg-violet-600 px-3 py-2 text-sm text-white hover:bg-violet-700 disabled:opacity-50"><Plus className="size-4" /> Add to Consultation</button>
+              <button type="button" disabled={!serviceCleared || !testPick || requestingLabTest} onClick={requestLabTest} className="flex items-center gap-1 rounded-md bg-orange-600 px-3 py-2 text-sm text-white hover:bg-orange-700 disabled:opacity-50">{requestingLabTest ? <Spinner /> : null} Request Lab Test</button>
             </div>
             <ul className="mt-2 space-y-1">
               {tests.map((t, i) => (
@@ -317,17 +390,22 @@ function Dashboard() {
           </div>
         ) : null}
 
-        {reviewMode || tests.length === 0 ? (
+        {reviewMode || tests.length === 0 || canPrescribe ? (
           <div className="rounded-md border bg-muted/30 p-3">
             <div className="mb-2 font-semibold text-sm">Prescription</div>
+            {!canPrescribe ? (
+              <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 p-2 text-sm text-amber-800">Prescription entry is locked until lab results are received.</div>
+            ) : (
+              <div className="mb-3 rounded-md border border-emerald-200 bg-emerald-50 p-2 text-sm text-emerald-800">Lab results are available, so prescription entry is unlocked.</div>
+            )}
             <div className="grid gap-2 sm:grid-cols-5">
-              <input placeholder="Medication" className={inputCls()} value={med.medicationName} onChange={(e) => setMed({ ...med, medicationName: e.target.value })} />
-              <input placeholder="Dosage" className={inputCls()} value={med.dosage} onChange={(e) => setMed({ ...med, dosage: e.target.value })} />
-              <select className={inputCls()} value={med.frequency} onChange={(e) => setMed({ ...med, frequency: e.target.value })}>{FREQS.map((f) => <option key={f}>{f}</option>)}</select>
-              <input placeholder="Duration" className={inputCls()} value={med.duration} onChange={(e) => setMed({ ...med, duration: e.target.value })} />
-              <input placeholder="Instructions" className={inputCls()} value={med.instructions} onChange={(e) => setMed({ ...med, instructions: e.target.value })} />
+              <input placeholder="Medication" disabled={!canPrescribe} className={inputCls()} value={med.medicationName} onChange={(e) => setMed({ ...med, medicationName: e.target.value })} />
+              <input placeholder="Dosage" disabled={!canPrescribe} className={inputCls()} value={med.dosage} onChange={(e) => setMed({ ...med, dosage: e.target.value })} />
+              <select disabled={!canPrescribe} className={inputCls()} value={med.frequency} onChange={(e) => setMed({ ...med, frequency: e.target.value })}>{FREQS.map((f) => <option key={f}>{f}</option>)}</select>
+              <input placeholder="Duration" disabled={!canPrescribe} className={inputCls()} value={med.duration} onChange={(e) => setMed({ ...med, duration: e.target.value })} />
+              <input placeholder="Instructions" disabled={!canPrescribe} className={inputCls()} value={med.instructions} onChange={(e) => setMed({ ...med, instructions: e.target.value })} />
             </div>
-            <button type="button" onClick={() => { if (med.medicationName && med.dosage) { setMeds((p) => [...p, med]); setMed({ medicationName: "", dosage: "", frequency: "Once Daily", duration: "", instructions: "" }); } }} className="mt-2 flex items-center gap-1 rounded-md bg-violet-600 px-3 py-2 text-sm text-white hover:bg-violet-700"><Plus className="size-4" /> Add Medication</button>
+            <button type="button" disabled={!canPrescribe} onClick={() => { if (med.medicationName && med.dosage) { setMeds((p) => [...p, med]); setMed({ medicationName: "", dosage: "", frequency: "Once Daily", duration: "", instructions: "" }); } }} className="mt-2 flex items-center gap-1 rounded-md bg-violet-600 px-3 py-2 text-sm text-white hover:bg-violet-700 disabled:opacity-60"><Plus className="size-4" /> Add Medication</button>
             <ul className="mt-2 space-y-1">
               {meds.map((m, i) => (
                 <li key={i} className="flex items-center justify-between rounded bg-white px-2 py-1 text-sm"><span>{m.medicationName} — {m.dosage}, {m.frequency}, {m.duration}</span><button type="button" onClick={() => setMeds(meds.filter((_, j) => j !== i))} className="text-rose-600"><X className="size-4" /></button></li>
@@ -344,8 +422,7 @@ function Dashboard() {
   }
 
   function ResultsTab() {
-    const myConsultIds = useMemo(() => new Set(consultations.filter((c) => c.consulted_by === staff?.staff_id).map((c) => c.id)), []);
-    const reqIds = useMemo(() => new Set(labRequests.filter((r) => r.consultation_id && myConsultIds.has(r.consultation_id)).map((r) => r.id)), [myConsultIds]);
+    const reqIds = useMemo(() => new Set(labRequests.filter((r) => r.requested_by === staff?.staff_id).map((r) => r.id)), [labRequests, staff?.staff_id]);
     const rows = labResults.filter((r) => reqIds.has(r.lab_request_id)).sort((a, b) => b.uploaded_at.localeCompare(a.uploaded_at));
     if (!rows.length) return <Empty />;
     return (

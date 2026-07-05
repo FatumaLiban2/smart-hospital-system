@@ -378,18 +378,18 @@ function Dashboard() {
         )}
         {awaitingApproval.length ? (
           <div className="rounded-md border bg-sky-50 p-3 text-sm text-sky-800">
-            {awaitingApproval.length} insurance claim(s) awaiting provider approval. The demo inbox entry is queued in Firestore and will flip to Sent when approved.
+            {awaitingApproval.length} Insurance claim(s) awaiting provider approval. 
           </div>
         ) : null}
         <div className="rounded-lg border bg-white p-4 shadow-sm">
           <div className="mb-3 flex items-center justify-between gap-2">
             <div>
-              <h3 className="text-sm font-semibold">Insurance Demo Inbox</h3>
-              <p className="text-xs text-muted-foreground">This replaces real email for the lecturer demo.</p>
+              <h3 className="text-sm font-semibold">Insurance Inbox</h3>
+              <p className="text-xs text-muted-foreground"></p>
             </div>
           </div>
           {!outboundNotifications.length ? (
-            <Empty message="No demo notifications yet" />
+            <Empty message="No insurance notifications yet" />
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -399,7 +399,7 @@ function Dashboard() {
                 <tbody>
                   {outboundNotifications.slice().sort((a, b) => b.created_at.localeCompare(a.created_at)).map((n) => (
                     <tr key={n.id} className="border-t">
-                      <td className="px-3 py-2">{n.channel ?? "Demo Inbox"}</td>
+                      <td className="px-3 py-2">{n.channel ?? "Insurance Inbox"}</td>
                       <td className="px-3 py-2">{n.provider}</td>
                       <td className="px-3 py-2">{n.recipient_email}</td>
                       <td className="px-3 py-2">{n.subject}</td>

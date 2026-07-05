@@ -64,7 +64,7 @@ export function RoleHeader({ title, accent }: { title: string; accent: string })
   );
 }
 
-const FLOW = ["Waiting","Awaiting Insurance Approval","Waiting for Triage","In Triage","Waiting for Consultation","In Consultation","In Lab","Waiting for Pharmacy","Discharged"];
+const FLOW = ["Waiting","Awaiting Insurance Approval","Waiting for Triage","In Triage","Waiting for Consultation","In Consultation","In Lab","Waiting for Pharmacy","In Pharmacy","Discharged"];
 
 export function FlowTracker() {
   const { visits } = usePatientData();

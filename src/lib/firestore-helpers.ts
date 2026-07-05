@@ -80,7 +80,7 @@ export function buildInsuranceNotificationPayload(args: {
   ].join("\n");
 
   return {
-    channel: "Demo Inbox",
+    channel: "Insurance Inbox",
     recipient_email: recipient,
     provider: args.provider,
     patient_id: args.patient.id,
