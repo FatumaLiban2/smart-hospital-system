@@ -1,8 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useMemo, useState } from "react";
-import { collection, doc, setDoc, updateDoc, writeBatch } from "firebase/firestore";
+import { useEffect, useMemo, useState } from "react";
+import { collection, doc, updateDoc, writeBatch } from "firebase/firestore";
 import { db } from "@/lib/firebase";
-import { buildDailyReportSummary, canProceedToService, matchInventoryItem, nextCode } from "@/lib/firestore-helpers";
+import { buildDailyReportSummary, canProceedToService, matchInventoryItem, nextCode, purposePaymentByVisit, stageLabPaymentStub } from "@/lib/firestore-helpers";
 import { useAuth } from "@/context/AuthContext";
 import { usePatientData, type LabRequest, type Payment } from "@/context/PatientDataContext";
 import { RoleGuard, RoleHeader, FlowTracker, StatCard, Tabs, Empty, Spinner, Field, inputCls, useToast, isToday, ageFromDob, priorityBadge, statusBadge } from "@/components/his/shared";
@@ -43,7 +43,7 @@ function Dashboard() {
   const queue = useMemo(() => visits.filter((v) => {
     if (v.status !== "Waiting for Consultation") return false;
     const patient = patients.find((p) => p.id === v.patient_id);
-    const payment = payments.find((p) => p.visit_id === v.id);
+    const payment = purposePaymentByVisit(payments, v.id, "Registration");
     return canProceedToService(payment, patient?.insurance_number);
   }), [patients, payments, visits]);
   const consultationsToday = consultations.filter((c) => isToday(c.consulted_at) && c.consulted_by === staff?.staff_id).length;
@@ -136,7 +136,7 @@ function Dashboard() {
     const visit = visits.find((v) => v.id === visitId);
     const patient = visit ? patients.find((p) => p.id === visit.patient_id) : null;
     const triage = visit ? triageRecords.find((t) => t.visit_id === visit.id) : null;
-    const payment = visit ? payments.find((p) => p.visit_id === visit.id) : null;
+    const payment = visit ? purposePaymentByVisit(payments, visit.id, "Registration") : null;
     const existingConsultation = visit ? consultations.find((c) => c.visit_id === visit.id) : null;
     const serviceCleared = canProceedToService(payment, patient?.insurance_number);
     const visitLabRequests = visit ? labRequests.filter((r) => r.visit_id === visit.id) : [];
@@ -149,10 +149,11 @@ function Dashboard() {
       const consultation = consultations.find((c) => c.visit_id === v.id);
       return !!consultation || v.status === "Waiting for Pharmacy";
     }), [consultations, visits]);
-    const reviewMode = !!(visit?.lab_returned_at && existingConsultation);
+    // Phase 2: labs have returned for this visit at least once. The form stays
+    // editable and pre-filled in both phases — only the lab-ordering section and
+    // required-field set differ.
+    const isPostLabPhase = !!visit?.lab_returned_at;
     const hasCompletedLabResults = visitLabResults.length > 0 || visitLabRequests.some((request) => isLabRequestCompleted(request));
-    const hasPendingLabRequest = visitLabRequests.some((request) => isLabRequestPending(request));
-    const canPrescribe = !hasPendingLabRequest || hasCompletedLabResults;
 
     const [form, setForm] = useState({ presenting_complaint: "", history_of_presenting_illness: "", examination_findings: "", diagnosis: "", treatment_plan: "" });
     const [errs, setErrs] = useState<Record<string, boolean>>({});
@@ -163,6 +164,28 @@ function Dashboard() {
     const [meds, setMeds] = useState<{ medicationName: string; dosage: string; frequency: string; duration: string; instructions: string }[]>([]);
     const [med, setMed] = useState({ medicationName: "", dosage: "", frequency: "Once Daily", duration: "", instructions: "" });
     const [saving, setSaving] = useState(false);
+
+    // Prescription stays locked as soon as any lab test is in play for this
+    // consultation — whether already persisted (visitLabRequests) or just
+    // staged locally (tests) — and only unlocks once labs are back and reviewed.
+    const hasAnyLabRequest = visitLabRequests.length > 0 || tests.length > 0;
+    const canPrescribe = !hasAnyLabRequest || (isPostLabPhase && hasCompletedLabResults);
+
+    // Sync the form from the saved consultation whenever the underlying doc
+    // changes (keyed on the stable id, not the object — Firestore snapshots
+    // produce a new object identity every tick even when nothing changed).
+    useEffect(() => {
+      setForm(existingConsultation
+        ? {
+          presenting_complaint: existingConsultation.presenting_complaint ?? "",
+          history_of_presenting_illness: existingConsultation.history_of_presenting_illness ?? "",
+          examination_findings: existingConsultation.examination_findings ?? "",
+          diagnosis: existingConsultation.diagnosis ?? "",
+          treatment_plan: existingConsultation.treatment_plan ?? "",
+        }
+        : { presenting_complaint: "", history_of_presenting_illness: "", examination_findings: "", diagnosis: "", treatment_plan: "" });
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [existingConsultation?.id, visitId]);
 
     if (!visit || !patient) {
       return (
@@ -195,7 +218,8 @@ function Dashboard() {
         const lab_code = await nextCode("LAB", "lab_requests");
         const requestRef = doc(collection(db, "lab_requests"));
         const now = new Date().toISOString();
-        await setDoc(requestRef, {
+        const batch = writeBatch(db);
+        batch.set(requestRef, {
           lab_code,
           patient_id: patient.id,
           visit_id: visit.id,
@@ -209,10 +233,13 @@ function Dashboard() {
           requested_by: staff!.staff_id,
           requested_at: now,
         });
+        await stageLabPaymentStub(batch, { payments, visitId: visit.id, patientId: patient.id, labRequestIds: [requestRef.id], staffId: staff!.staff_id });
+        batch.update(doc(db, "visits", visit.id), { status: "Waiting for Lab Payment" });
+        await batch.commit();
         setTests((prev) => (prev.includes(testPick) ? prev : [...prev, testPick]));
         setRequestedLabTests((prev) => (prev.includes(testPick) ? prev : [...prev, testPick]));
         setTestPick("");
-        toast.success(`${testPick} sent to the lab queue`);
+        toast.success(`${testPick} sent to the lab queue — payment routed to Receptionist`);
       } catch (err: unknown) {
         toast.error((err as Error).message ?? "Lab request failed");
       } finally {
@@ -222,7 +249,7 @@ function Dashboard() {
 
     const submit = async (e: React.FormEvent) => {
       e.preventDefault();
-      const required = reviewMode ? [] : ["presenting_complaint","diagnosis","treatment_plan"] as const;
+      const required = ["presenting_complaint","diagnosis","treatment_plan"] as const;
       const next: Record<string, boolean> = {};
       required.forEach((k) => { if (!form[k]) next[k] = true; });
       setErrs(next);
@@ -234,20 +261,20 @@ function Dashboard() {
         const now = new Date().toISOString();
         const consRef = existingConsultation ? doc(db, "consultations", existingConsultation.id) : doc(collection(db, "consultations"));
 
-        if (!reviewMode && !existingConsultation) {
-          batch.set(consRef, {
-            ...form,
-            patient_id: patient.id,
-            visit_id: visit.id,
-            consulted_by: staff!.staff_id,
-            consulted_at: now,
-          });
-        }
+        batch.set(consRef, {
+          ...form,
+          patient_id: patient.id,
+          visit_id: visit.id,
+          ...(existingConsultation ? {} : { consulted_by: staff!.staff_id, consulted_at: now }),
+          updated_by: staff!.staff_id,
+          updated_at: now,
+        }, { merge: true });
 
         const inventoryAdjustments = new Map<string, number>();
 
         const pendingLabTestsToSave = tests.filter((test) => !requestedLabTests.includes(test));
-        if (!reviewMode && pendingLabTestsToSave.length) {
+        const newLabRequestIds: string[] = [];
+        if (pendingLabTestsToSave.length) {
           for (const t of pendingLabTestsToSave) {
             const lab_code = await nextCode("LAB", "lab_requests");
             const labRef = doc(collection(db, "lab_requests"));
@@ -265,7 +292,9 @@ function Dashboard() {
               requested_by: staff!.staff_id,
               requested_at: now,
             });
+            newLabRequestIds.push(labRef.id);
           }
+          await stageLabPaymentStub(batch, { payments, visitId: visit.id, patientId: patient.id, labRequestIds: newLabRequestIds, staffId: staff!.staff_id });
         }
 
         const orphanLabRequests = labRequests.filter((r) => r.visit_id === visit.id && !r.consultation_id);
@@ -273,7 +302,7 @@ function Dashboard() {
           batch.update(doc(db, "lab_requests", request.id), { consultation_id: consRef.id });
         }
 
-        if ((reviewMode || tests.length === 0) && meds.length && (reviewMode || canPrescribe)) {
+        if (meds.length && canPrescribe) {
           const rx_code = await nextCode("RX", "prescriptions");
           const rxRef = doc(collection(db, "prescriptions"));
           batch.set(rxRef, {
@@ -302,11 +331,14 @@ function Dashboard() {
           }
         }
 
-       const nextStatus = reviewMode ? "Waiting for Pharmacy" : tests.length ? "In Lab" : "Waiting for Pharmacy";
-        batch.update(doc(db, "visits", visit.id), reviewMode ? { status: nextStatus, lab_returned_at: null } : { status: nextStatus });
+        const sendingNewLabTests = pendingLabTestsToSave.length > 0;
+        const nextStatus = sendingNewLabTests ? "Waiting for Lab Payment" : "Waiting for Pharmacy";
+        const visitUpdate: Record<string, unknown> = { status: nextStatus };
+        if (isPostLabPhase) visitUpdate.lab_returned_at = null;
+        batch.update(doc(db, "visits", visit.id), visitUpdate);
         await batch.commit();
         setSaving(false);
-        toast.success(reviewMode ? `Prescription saved. Patient → ${nextStatus}` : `Consultation saved. Patient → ${nextStatus}`);
+        toast.success(isPostLabPhase ? `Consultation updated. Patient → ${nextStatus}` : `Consultation saved. Patient → ${nextStatus}`);
         setActiveVisitId(null); setVisitId("");
         setForm({ presenting_complaint: "", history_of_presenting_illness: "", examination_findings: "", diagnosis: "", treatment_plan: "" });
         setTests([]); setMeds([]);
@@ -347,10 +379,9 @@ function Dashboard() {
           </div>
         </div>
 
-        {reviewMode ? (
+        {isPostLabPhase ? (
           <div className="space-y-3 rounded-md border bg-emerald-50 p-3 text-sm text-emerald-900">
             <div className="font-semibold">Lab Review</div>
-            <div>Previous consult: {existingConsultation?.diagnosis ?? "—"}</div>
             <div className="space-y-2">
               {visitLabResults.length ? visitLabResults.map((r) => {
                 const req = visitLabRequests.find((x) => x.id === r.lab_request_id);
@@ -360,17 +391,15 @@ function Dashboard() {
           </div>
         ) : null}
 
-        {!reviewMode ? (
-          <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="Presenting Complaint" required><textarea rows={3} className={inputCls(errs.presenting_complaint)} value={form.presenting_complaint} onChange={(e) => setForm({ ...form, presenting_complaint: e.target.value })} /></Field>
-            <Field label="History of Presenting Illness"><textarea rows={3} className={inputCls()} value={form.history_of_presenting_illness} onChange={(e) => setForm({ ...form, history_of_presenting_illness: e.target.value })} /></Field>
-            <Field label="Examination Findings"><textarea rows={3} className={inputCls()} value={form.examination_findings} onChange={(e) => setForm({ ...form, examination_findings: e.target.value })} /></Field>
-            <Field label="Diagnosis" required><textarea rows={3} className={inputCls(errs.diagnosis)} value={form.diagnosis} onChange={(e) => setForm({ ...form, diagnosis: e.target.value })} /></Field>
-            <div className="sm:col-span-2"><Field label="Treatment Plan" required><textarea rows={3} className={inputCls(errs.treatment_plan)} value={form.treatment_plan} onChange={(e) => setForm({ ...form, treatment_plan: e.target.value })} /></Field></div>
-          </div>
-        ) : null}
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Presenting Complaint" required><textarea rows={3} className={inputCls(errs.presenting_complaint)} value={form.presenting_complaint} onChange={(e) => setForm({ ...form, presenting_complaint: e.target.value })} /></Field>
+          <Field label="History of Presenting Illness"><textarea rows={3} className={inputCls()} value={form.history_of_presenting_illness} onChange={(e) => setForm({ ...form, history_of_presenting_illness: e.target.value })} /></Field>
+          <Field label="Examination Findings"><textarea rows={3} className={inputCls()} value={form.examination_findings} onChange={(e) => setForm({ ...form, examination_findings: e.target.value })} /></Field>
+          <Field label="Diagnosis" required><textarea rows={3} className={inputCls(errs.diagnosis)} value={form.diagnosis} onChange={(e) => setForm({ ...form, diagnosis: e.target.value })} /></Field>
+          <div className="sm:col-span-2"><Field label="Treatment Plan" required><textarea rows={3} className={inputCls(errs.treatment_plan)} value={form.treatment_plan} onChange={(e) => setForm({ ...form, treatment_plan: e.target.value })} /></Field></div>
+        </div>
 
-        {!reviewMode ? (
+        {!isPostLabPhase ? (
           <div className="rounded-md border bg-muted/30 p-3">
             <div className="mb-2 font-semibold text-sm">Laboratory Requests</div>
             {!serviceCleared ? <p className="mb-2 text-xs text-amber-700">Lab requests remain locked until payment is cleared or insurance is validated.</p> : null}
@@ -390,33 +419,29 @@ function Dashboard() {
           </div>
         ) : null}
 
-        {reviewMode || tests.length === 0 || canPrescribe ? (
-          <div className="rounded-md border bg-muted/30 p-3">
-            <div className="mb-2 font-semibold text-sm">Prescription</div>
-            {!canPrescribe ? (
-              <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 p-2 text-sm text-amber-800">Prescription entry is locked until lab results are received.</div>
-            ) : (
-              <div className="mb-3 rounded-md border border-emerald-200 bg-emerald-50 p-2 text-sm text-emerald-800">Lab results are available, so prescription entry is unlocked.</div>
-            )}
-            <div className="grid gap-2 sm:grid-cols-5">
-              <input placeholder="Medication" disabled={!canPrescribe} className={inputCls()} value={med.medicationName} onChange={(e) => setMed({ ...med, medicationName: e.target.value })} />
-              <input placeholder="Dosage" disabled={!canPrescribe} className={inputCls()} value={med.dosage} onChange={(e) => setMed({ ...med, dosage: e.target.value })} />
-              <select disabled={!canPrescribe} className={inputCls()} value={med.frequency} onChange={(e) => setMed({ ...med, frequency: e.target.value })}>{FREQS.map((f) => <option key={f}>{f}</option>)}</select>
-              <input placeholder="Duration" disabled={!canPrescribe} className={inputCls()} value={med.duration} onChange={(e) => setMed({ ...med, duration: e.target.value })} />
-              <input placeholder="Instructions" disabled={!canPrescribe} className={inputCls()} value={med.instructions} onChange={(e) => setMed({ ...med, instructions: e.target.value })} />
-            </div>
-            <button type="button" disabled={!canPrescribe} onClick={() => { if (med.medicationName && med.dosage) { setMeds((p) => [...p, med]); setMed({ medicationName: "", dosage: "", frequency: "Once Daily", duration: "", instructions: "" }); } }} className="mt-2 flex items-center gap-1 rounded-md bg-violet-600 px-3 py-2 text-sm text-white hover:bg-violet-700 disabled:opacity-60"><Plus className="size-4" /> Add Medication</button>
-            <ul className="mt-2 space-y-1">
-              {meds.map((m, i) => (
-                <li key={i} className="flex items-center justify-between rounded bg-white px-2 py-1 text-sm"><span>{m.medicationName} — {m.dosage}, {m.frequency}, {m.duration}</span><button type="button" onClick={() => setMeds(meds.filter((_, j) => j !== i))} className="text-rose-600"><X className="size-4" /></button></li>
-              ))}
-            </ul>
+        <div className="rounded-md border bg-muted/30 p-3">
+          <div className="mb-2 font-semibold text-sm">Prescription</div>
+          {!canPrescribe ? (
+            <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 p-2 text-sm text-amber-800">Prescription entry is locked until lab results are received and reviewed.</div>
+          ) : hasAnyLabRequest ? (
+            <div className="mb-3 rounded-md border border-emerald-200 bg-emerald-50 p-2 text-sm text-emerald-800">Lab results are available, so prescription entry is unlocked.</div>
+          ) : null}
+          <div className="grid gap-2 sm:grid-cols-5">
+            <input placeholder="Medication" disabled={!canPrescribe} className={inputCls()} value={med.medicationName} onChange={(e) => setMed({ ...med, medicationName: e.target.value })} />
+            <input placeholder="Dosage" disabled={!canPrescribe} className={inputCls()} value={med.dosage} onChange={(e) => setMed({ ...med, dosage: e.target.value })} />
+            <select disabled={!canPrescribe} className={inputCls()} value={med.frequency} onChange={(e) => setMed({ ...med, frequency: e.target.value })}>{FREQS.map((f) => <option key={f}>{f}</option>)}</select>
+            <input placeholder="Duration" disabled={!canPrescribe} className={inputCls()} value={med.duration} onChange={(e) => setMed({ ...med, duration: e.target.value })} />
+            <input placeholder="Instructions" disabled={!canPrescribe} className={inputCls()} value={med.instructions} onChange={(e) => setMed({ ...med, instructions: e.target.value })} />
           </div>
-        ) : (
-          <div className="rounded-md border bg-amber-50 p-3 text-sm text-amber-800">Prescription entry is deferred until lab results are reviewed.</div>
-        )}
+          <button type="button" disabled={!canPrescribe} onClick={() => { if (med.medicationName && med.dosage) { setMeds((p) => [...p, med]); setMed({ medicationName: "", dosage: "", frequency: "Once Daily", duration: "", instructions: "" }); } }} className="mt-2 flex items-center gap-1 rounded-md bg-violet-600 px-3 py-2 text-sm text-white hover:bg-violet-700 disabled:opacity-60"><Plus className="size-4" /> Add Medication</button>
+          <ul className="mt-2 space-y-1">
+            {meds.map((m, i) => (
+              <li key={i} className="flex items-center justify-between rounded bg-white px-2 py-1 text-sm"><span>{m.medicationName} — {m.dosage}, {m.frequency}, {m.duration}</span><button type="button" onClick={() => setMeds(meds.filter((_, j) => j !== i))} className="text-rose-600"><X className="size-4" /></button></li>
+            ))}
+          </ul>
+        </div>
 
-        <button disabled={saving} className="flex items-center gap-2 rounded-md bg-violet-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-violet-700 disabled:opacity-60">{saving ? <Spinner /> : null} {reviewMode ? "Save Prescription Review" : "Save Consultation"}</button>
+        <button disabled={saving} className="flex items-center gap-2 rounded-md bg-violet-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-violet-700 disabled:opacity-60">{saving ? <Spinner /> : null} {isPostLabPhase ? "Save Prescription Review" : "Save Consultation"}</button>
       </form>
     );
   }

@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useState, type ReactNode } from "
 import { collection, onSnapshot, type DocumentData, type QuerySnapshot } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "./AuthContext";
+import { allPaymentsCleared as allPaymentsClearedFor, purposePaymentByVisit, type PaymentPurpose } from "@/lib/firestore-helpers";
 
 export interface Patient {
   id: string;
@@ -23,6 +24,8 @@ export interface Visit {
   visit_date: string;
   created_by: string;
   lab_returned_at?: string | null;
+  discharged_at?: string | null;
+  discharged_by?: string | null;
 }
 export interface Payment {
   id: string;
@@ -30,15 +33,20 @@ export interface Payment {
   receipt_number: string;
   patient_id: string;
   visit_id: string;
-  method: string;
+  purpose?: PaymentPurpose;
+  lab_request_ids?: string[];
+  prescription_ids?: string[];
+  method: string | null;
   insurance_provider: string | null;
   insurance_number?: string | null;
   mpesa_reference?: string | null;
   phone_number?: string | null;
   amount: number;
   status: string;
-  processed_by: string;
-  processed_at: string;
+  processed_by: string | null;
+  processed_at: string | null;
+  created_by?: string;
+  created_at?: string;
 }
 export interface TriageRecord {
   id: string;
@@ -69,6 +77,8 @@ export interface Consultation {
   treatment_plan: string | null;
   consulted_by: string;
   consulted_at: string;
+  updated_by?: string | null;
+  updated_at?: string | null;
 }
 export interface LabRequest {
   id: string;
@@ -155,6 +165,9 @@ interface DataCtx {
   patientById: (id: string) => Patient | undefined;
   triageByVisit: (visitId: string) => TriageRecord | undefined;
   paymentByVisit: (visitId: string) => Payment | undefined;
+  paymentsByVisit: (visitId: string) => Payment[];
+  paymentByVisitAndPurpose: (visitId: string, purpose: PaymentPurpose) => Payment | undefined;
+  allPaymentsCleared: (visitId: string) => boolean;
   consultationByVisit: (visitId: string) => Consultation | undefined;
 }
 
@@ -190,7 +203,10 @@ export function PatientDataProvider({ children }: { children: ReactNode }) {
     labRequests, labResults, prescriptions, inventory, outboundNotifications,
     patientById: (id) => patients.find((p) => p.id === id),
     triageByVisit: (visitId) => triageRecords.find((t) => t.visit_id === visitId),
-    paymentByVisit: (visitId) => payments.find((p) => p.visit_id === visitId),
+    paymentByVisit: (visitId) => purposePaymentByVisit(payments, visitId, "Registration"),
+    paymentsByVisit: (visitId) => payments.filter((p) => p.visit_id === visitId),
+    paymentByVisitAndPurpose: (visitId, purpose) => purposePaymentByVisit(payments, visitId, purpose),
+    allPaymentsCleared: (visitId) => allPaymentsClearedFor(payments, visitId),
     consultationByVisit: (visitId) => consultations.find((c) => c.visit_id === visitId),
   };
 
@@ -205,5 +221,6 @@ export function usePatientData() {
 
 export const VISIT_STATUSES = [
   "Waiting", "Awaiting Insurance Approval", "Waiting for Triage", "In Triage", "Waiting for Consultation",
-  "In Consultation", "In Lab", "Waiting for Pharmacy", "In Pharmacy", "Discharged",
+  "In Consultation", "Waiting for Lab Payment", "In Lab", "Waiting for Pharmacy", "In Pharmacy",
+  "Waiting for Pharmacy Payment", "Ready for Discharge", "Discharged",
 ] as const;

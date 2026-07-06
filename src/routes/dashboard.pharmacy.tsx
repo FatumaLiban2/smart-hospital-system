@@ -1,9 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
-import { doc, updateDoc } from "firebase/firestore";
+import { doc, updateDoc, writeBatch } from "firebase/firestore";
 import { db } from "@/lib/firebase";
-import { recomputeInventoryStatus } from "@/lib/firestore-helpers";
-import { canProceedToService } from "@/lib/firestore-helpers";
+import { canProceedToService, purposePaymentByVisit, recomputeInventoryStatus, stagePharmacyPaymentStub } from "@/lib/firestore-helpers";
 import { useAuth } from "@/context/AuthContext";
 import { usePatientData } from "@/context/PatientDataContext";
 import { RoleGuard, RoleHeader, FlowTracker, StatCard, Tabs, Empty, Spinner, Field, inputCls, useToast, isToday, statusBadge } from "@/components/his/shared";
@@ -72,7 +71,7 @@ function Dashboard() {
     const rx = prescriptions.find((r) => r.id === rxId);
     const patient = rx ? patients.find((p) => p.id === rx.patient_id) : null;
     const cons = rx ? consultations.find((c) => c.id === rx.consultation_id) : null;
-    const pay = rx ? payments.find((p) => p.visit_id === rx.visit_id) : null;
+    const pay = rx ? purposePaymentByVisit(payments, rx.visit_id, "Registration") : null;
     const serviceCleared = canProceedToService(pay, patient?.insurance_number);
     const [checks, setChecks] = useState<Record<number, { dispensed: boolean; qty: string; subst: string }>>({});
     const [notes, setNotes] = useState("");
@@ -97,15 +96,19 @@ function Dashboard() {
       }
       setSaving(true);
       try {
-        await updateDoc(doc(db, "prescriptions", rx.id), {
+        const now = new Date().toISOString();
+        const batch = writeBatch(db);
+        batch.update(doc(db, "prescriptions", rx.id), {
           dispensed: true,
           dispensed_by: staff!.staff_id,
-          dispensed_at: new Date().toISOString(),
+          dispensed_at: now,
           notes: notes || null,
         });
-        await updateDoc(doc(db, "visits", rx.visit_id), { status: "Discharged" });
+        await stagePharmacyPaymentStub(batch, { payments, visitId: rx.visit_id, patientId: patient.id, prescriptionIds: [rx.id], staffId: staff!.staff_id });
+        batch.update(doc(db, "visits", rx.visit_id), { status: "Waiting for Pharmacy Payment" });
+        await batch.commit();
         setSaving(false);
-        toast.success("Prescription dispensed. Patient discharged.");
+        toast.success("Prescription dispensed. Medication fee routed to Receptionist for billing.");
         setActiveRx(null); setRxId(""); setChecks({}); setNotes("");
         setTab("queue");
       } catch (err: unknown) {

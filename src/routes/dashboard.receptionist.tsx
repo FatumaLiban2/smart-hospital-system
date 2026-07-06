@@ -1,8 +1,21 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { collection, doc, updateDoc, writeBatch } from "firebase/firestore";
 import { db } from "@/lib/firebase";
-import { buildInsuranceNotificationPayload, nextCode, validInsuranceNumber } from "@/lib/firestore-helpers";
+import {
+  allPaymentsCleared,
+  buildInsuranceNotificationPayload,
+  nextCode,
+  nextStatusAfterInsuranceSubmitted,
+  nextStatusAfterPaymentCleared,
+  purposeOf,
+  purposePaymentByVisit,
+  rejectInsuranceClaim,
+  settleInsuranceApproval,
+  validInsuranceNumber,
+  type PaymentPurpose,
+} from "@/lib/firestore-helpers";
+import { sendEmail } from "@/lib/email.server";
 import { useAuth } from "@/context/AuthContext";
 import { usePatientData, type Patient, type Payment, type Visit } from "@/context/PatientDataContext";
 import { RoleGuard, RoleHeader, FlowTracker, StatCard, Tabs, Empty, Spinner, Field, inputCls, Modal, useToast, statusBadge, isToday, ageFromDob } from "@/components/his/shared";
@@ -10,7 +23,10 @@ import { Search, Banknote, Shield, Smartphone, Printer } from "lucide-react";
 
 export const Route = createFileRoute("/dashboard/receptionist")({ component: () => <RoleGuard role="Receptionist"><Dashboard /></RoleGuard> });
 
-type Tab = "register" | "queue" | "search" | "records" | "payments";
+const INSURANCE_TEST_RECIPIENT = "fatuma.omar@strathmore.edu";
+const AUTO_APPROVE_DELAY_MS = 25_000;
+
+type Tab = "register" | "queue" | "search" | "records" | "billing" | "payments";
 
 const INSURANCE = ["SHA/NHIF","AAR","Britam","Jubilee","CIC","Other"];
 
@@ -23,15 +39,51 @@ function Dashboard() {
   const { patients, visits, payments, outboundNotifications } = usePatientData();
   const { toast, ui: toastUi } = useToast();
   const [tab, setTab] = useState<Tab>("register");
-  const [paymentFor, setPaymentFor] = useState<{ patient: Patient; visit: Visit } | null>(null);
+  const [paymentFor, setPaymentFor] = useState<{ patient: Patient; visit: Visit; existingPayment?: Payment } | null>(null);
   const [receiptPayment, setReceiptPayment] = useState<{ payment: Payment; patient: Patient } | null>(null);
 
   const todays = visits.filter((v) => isToday(v.visit_date));
-  const activeStatuses = ["Waiting","Awaiting Insurance Approval","Waiting for Triage","In Triage","Waiting for Consultation","In Consultation","In Lab","Waiting for Pharmacy"];
+  const activeStatuses = ["Waiting","Awaiting Insurance Approval","Waiting for Triage","In Triage","Waiting for Consultation","In Consultation","Waiting for Lab Payment","In Lab","Waiting for Pharmacy","In Pharmacy","Waiting for Pharmacy Payment"];
   const stats = {
     total: todays.length,
     active: todays.filter((v) => activeStatuses.includes(v.status)).length,
     waitingTriage: todays.filter((v) => v.status === "Waiting for Triage" || v.status === "Waiting").length,
+  };
+
+  // Demo insurance automation: simulate the provider's "reply" auto-approving
+  // the claim a short while after it's submitted. Manual Approve/Reject in
+  // PaymentsTab remain fully functional — settleInsuranceApproval no-ops if
+  // the payment already left "Pending Approval" by the time the timer fires.
+  const latestRef = useRef({ payments, visits, outboundNotifications });
+  useEffect(() => { latestRef.current = { payments, visits, outboundNotifications }; });
+  const scheduledRef = useRef<Set<string>>(new Set());
+  const timeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  useEffect(() => {
+    for (const p of payments) {
+      if (p.method !== "Insurance" || p.status !== "Pending Approval") continue;
+      if (scheduledRef.current.has(p.id)) continue;
+      scheduledRef.current.add(p.id);
+      const t = setTimeout(async () => {
+        const latest = latestRef.current;
+        await settleInsuranceApproval({ paymentId: p.id, payments: latest.payments, visits: latest.visits, outboundNotifications: latest.outboundNotifications, approvedBy: null });
+        timeoutsRef.current.delete(p.id);
+      }, AUTO_APPROVE_DELAY_MS);
+      timeoutsRef.current.set(p.id, t);
+    }
+  }, [payments]);
+  useEffect(() => () => { timeoutsRef.current.forEach(clearTimeout); }, []);
+
+  const dischargeVisit = async (visitId: string) => {
+    if (!allPaymentsCleared(payments, visitId)) {
+      toast.error("All payments must be cleared before discharge.");
+      return;
+    }
+    await updateDoc(doc(db, "visits", visitId), {
+      status: "Discharged",
+      discharged_at: new Date().toISOString(),
+      discharged_by: staff?.staff_id ?? null,
+    });
+    toast.success("Patient discharged");
   };
 
   return (
@@ -53,6 +105,7 @@ function Dashboard() {
             { id: "queue", label: "Patient Queue" },
             { id: "search", label: "Search Patient" },
             { id: "records", label: "Patient Records" },
+            { id: "billing", label: "Billing Queue" },
             { id: "payments", label: "Payments" },
           ]}
         />
@@ -61,6 +114,7 @@ function Dashboard() {
           {tab === "queue" ? <QueueTab onCollect={(p, v) => setPaymentFor({ patient: p, visit: v })} /> : null}
           {tab === "search" ? <SearchTab /> : null}
           {tab === "records" ? <RecordsTab /> : null}
+          {tab === "billing" ? <BillingQueueTab onBill={(p, v, existingPayment) => setPaymentFor({ patient: p, visit: v, existingPayment })} onDischarge={dischargeVisit} /> : null}
           {tab === "payments" ? <PaymentsTab /> : null}
         </div>
       </div>
@@ -70,6 +124,7 @@ function Dashboard() {
         onClose={() => setPaymentFor(null)}
         patient={paymentFor?.patient ?? null}
         visit={paymentFor?.visit ?? null}
+        existingPayment={paymentFor?.existingPayment ?? null}
         staffId={staff?.staff_id ?? ""}
         staffName={staff ? `${staff.first_name} ${staff.last_name}` : ""}
         onDone={(msg, mpesaReceipt) => {
@@ -228,7 +283,7 @@ function Dashboard() {
           <tbody>
             {rows.map((v) => {
               const p = patients.find((x) => x.id === v.patient_id);
-              const pay = payments.find((py) => py.visit_id === v.id);
+              const pay = purposePaymentByVisit(payments, v.id, "Registration");
               if (!p) return null;
               return (
                 <tr key={v.id} className="border-t">
@@ -249,6 +304,63 @@ function Dashboard() {
             })}
           </tbody>
         </table>
+      </div>
+    );
+  }
+
+  function BillingQueueTab({ onBill, onDischarge }: { onBill: (p: Patient, v: Visit, existingPayment: Payment) => void; onDischarge: (visitId: string) => void }) {
+    const openStubs = payments.filter((p) => p.status === "Unbilled" || p.status === "Rejected");
+    const readyForDischarge = visits.filter((v) => v.status === "Ready for Discharge");
+    return (
+      <div className="space-y-6">
+        <div>
+          <h3 className="mb-2 text-sm font-semibold">Bills Awaiting Payment</h3>
+          {!openStubs.length ? <Empty message="No outstanding lab or pharmacy bills" /> : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-muted/40 text-left text-xs uppercase text-muted-foreground"><tr><th className="px-3 py-2">Patient</th><th className="px-3 py-2">Purpose</th><th className="px-3 py-2">Status</th><th className="px-3 py-2">Created</th><th className="px-3 py-2"></th></tr></thead>
+                <tbody>
+                  {openStubs.map((stub) => {
+                    const patient = patients.find((x) => x.id === stub.patient_id);
+                    const visit = visits.find((x) => x.id === stub.visit_id);
+                    if (!patient || !visit) return null;
+                    return (
+                      <tr key={stub.id} className="border-t">
+                        <td className="px-3 py-2">{patient.first_name} {patient.last_name} <span className="font-mono text-xs text-muted-foreground">{patient.patient_code}</span></td>
+                        <td className="px-3 py-2">{purposeOf(stub)}</td>
+                        <td className="px-3 py-2"><span className={`rounded px-2 py-0.5 text-xs ${statusBadge(stub.status)}`}>{stub.status}</span></td>
+                        <td className="px-3 py-2">{stub.created_at ? new Date(stub.created_at).toLocaleString() : "—"}</td>
+                        <td className="px-3 py-2"><button onClick={() => onBill(patient, visit, stub)} className="rounded-md bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-700">Bill Now</button></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+        <div>
+          <h3 className="mb-2 text-sm font-semibold">Ready for Discharge</h3>
+          {!readyForDischarge.length ? <Empty message="No patients ready for discharge" /> : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-muted/40 text-left text-xs uppercase text-muted-foreground"><tr><th className="px-3 py-2">Patient</th><th className="px-3 py-2"></th></tr></thead>
+                <tbody>
+                  {readyForDischarge.map((v) => {
+                    const patient = patients.find((x) => x.id === v.patient_id);
+                    if (!patient) return null;
+                    return (
+                      <tr key={v.id} className="border-t">
+                        <td className="px-3 py-2">{patient.first_name} {patient.last_name} <span className="font-mono text-xs text-muted-foreground">{patient.patient_code}</span></td>
+                        <td className="px-3 py-2"><button onClick={() => onDischarge(v.id)} className="rounded-md bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-700">Discharge Patient</button></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       </div>
     );
   }
@@ -309,30 +421,14 @@ function Dashboard() {
     const totalRevenue = cash + mpesa;
 
     const approveInsurance = async (paymentId: string) => {
-      const payment = payments.find((p) => p.id === paymentId);
-      if (!payment) return;
-      const visit = visits.find((v) => v.id === payment.visit_id);
-      const patient = patients.find((p) => p.id === payment.patient_id);
-      if (!visit || !patient) return;
-      const notification = outboundNotifications.find((item) => item.payment_id === paymentId);
-      const batch = writeBatch(db);
-      batch.update(doc(db, "payments", paymentId), { status: "Approved" });
-      batch.update(doc(db, "visits", visit.id), { status: "Waiting for Triage" });
-      if (notification) {
-        batch.update(doc(db, "outbound_notifications", notification.id), {
-          status: "Sent",
-          delivered_at: new Date().toISOString(),
-          delivered_by: staff?.staff_id ?? null,
-        });
-      }
-      await batch.commit();
-      toast.success(`Insurance approved for ${patient.patient_code}`);
+      const patient = patients.find((p) => p.id === payments.find((py) => py.id === paymentId)?.patient_id);
+      const result = await settleInsuranceApproval({ paymentId, payments, visits, outboundNotifications, approvedBy: staff?.staff_id ?? null });
+      if (result.ok) toast.success(`Insurance approved${patient ? ` for ${patient.patient_code}` : ""}`);
+      else toast.error("Could not approve claim (already settled?)");
     };
 
     const rejectInsurance = async (paymentId: string) => {
-      const batch = writeBatch(db);
-      batch.update(doc(db, "payments", paymentId), { status: "Rejected" });
-      await batch.commit();
+      await rejectInsuranceClaim(paymentId);
       toast.error("Insurance claim rejected");
     };
     return (
@@ -360,7 +456,7 @@ function Dashboard() {
                       <td className="px-3 py-2 font-mono text-xs">{p.mpesa_reference ?? "—"}</td>
                       <td className="px-3 py-2">KES {Number(p.amount).toLocaleString()}</td>
                       <td className="px-3 py-2"><span className={`rounded px-2 py-0.5 text-xs ${statusBadge(p.status)}`}>{p.status}</span></td>
-                      <td className="px-3 py-2">{new Date(p.processed_at).toLocaleTimeString()}</td>
+                      <td className="px-3 py-2">{p.processed_at ? new Date(p.processed_at).toLocaleTimeString() : "—"}</td>
                       <td className="px-3 py-2">
                         {p.method === "Insurance" && p.status === "Pending Approval" ? (
                           <div className="flex gap-2">
@@ -456,7 +552,8 @@ function validMpesaRef(ref: string) {
   return /^[A-Z0-9]{8,12}$/.test(ref.trim().toUpperCase());
 }
 
-function PaymentModal({ open, onClose, patient, visit, staffId, staffName, onDone, onError }: { open: boolean; onClose: () => void; patient: Patient | null; visit: Visit | null; staffId: string; staffName: string; onDone: (msg: string, mpesaReceipt?: { payment: Payment; patient: Patient }) => void; onError: (msg: string) => void }) {
+function PaymentModal({ open, onClose, patient, visit, existingPayment, staffId, staffName, onDone, onError }: { open: boolean; onClose: () => void; patient: Patient | null; visit: Visit | null; existingPayment?: Payment | null; staffId: string; staffName: string; onDone: (msg: string, mpesaReceipt?: { payment: Payment; patient: Patient }) => void; onError: (msg: string) => void }) {
+  const { payments } = usePatientData();
   const [method, setMethod] = useState<PaymentMethod>("Cash");
   const [amount, setAmount] = useState("");
   const [provider, setProvider] = useState("SHA/NHIF");
@@ -501,16 +598,20 @@ function PaymentModal({ open, onClose, patient, visit, staffId, staffName, onDon
     if (Object.keys(next).length) { onError("Please fix payment form errors"); return; }
     setSaving(true);
     try {
+      const purpose: PaymentPurpose = existingPayment ? purposeOf(existingPayment) : "Registration";
       const receipt_number = await nextCode("RCP", "receipts");
-      const payment_id = await nextCode("PAY", "payments_seq");
+      const payment_id = existingPayment?.payment_id ?? (await nextCode("PAY", "payments_seq"));
       const processed_at = new Date().toISOString();
       const paymentStatus = method === "Insurance" ? "Pending Approval" : "Paid";
-      const paymentRef = doc(collection(db, "payments"));
+      const paymentRef = existingPayment ? doc(db, "payments", existingPayment.id) : doc(collection(db, "payments"));
       const visitRef = doc(db, "visits", visit.id);
       const batch = writeBatch(db);
       const docPayload = {
         payment_id,
         receipt_number,
+        purpose,
+        ...(existingPayment?.lab_request_ids ? { lab_request_ids: existingPayment.lab_request_ids } : {}),
+        ...(existingPayment?.prescription_ids ? { prescription_ids: existingPayment.prescription_ids } : {}),
         patient_id: patient.id,
         visit_id: visit.id,
         method,
@@ -523,25 +624,43 @@ function PaymentModal({ open, onClose, patient, visit, staffId, staffName, onDon
         phone_number: method === "MPesa" ? phone.trim() : null,
         insurance_number: method === "Insurance" ? insNum.trim() : null,
       };
-      batch.set(paymentRef, docPayload);
-      batch.update(visitRef, { status: method === "Insurance" ? "Awaiting Insurance Approval" : "Waiting for Triage" });
+      batch.set(paymentRef, docPayload, { merge: true });
+      const projectedPayments: Payment[] = payments.some((p) => p.id === paymentRef.id)
+        ? payments.map((p) => (p.id === paymentRef.id ? ({ ...p, ...docPayload } as Payment) : p))
+        : [...payments, { id: paymentRef.id, ...docPayload } as Payment];
+      const nextVisitStatus = paymentStatus === "Pending Approval"
+        ? nextStatusAfterInsuranceSubmitted(purpose)
+        : nextStatusAfterPaymentCleared({ purpose, visitId: visit.id, projectedPayments });
+      batch.update(visitRef, { status: nextVisitStatus });
+      let insuranceNotification: ReturnType<typeof buildInsuranceNotificationPayload> | null = null;
       if (method === "Insurance") {
-        batch.set(doc(collection(db, "outbound_notifications")), buildInsuranceNotificationPayload({
+        insuranceNotification = buildInsuranceNotificationPayload({
           provider,
           patient: { id: patient.id, patient_code: patient.patient_code, first_name: patient.first_name, last_name: patient.last_name, insurance_number: insNum.trim() },
           visit: { id: visit.id, visit_date: visit.visit_date, status: visit.status },
           payment: { id: paymentRef.id, receipt_number, amount: Number(amount || 0), status: paymentStatus, processed_at },
           staff: { staff_id: staffId, display_name: staffName || staffId },
-        }));
+        });
+        // Insurance Inbox displays the demo test address (where the email
+        // actually goes), while the body text still narrates the realistic
+        // per-provider address for demo flavor.
+        batch.set(doc(collection(db, "outbound_notifications")), { ...insuranceNotification, recipient_email: INSURANCE_TEST_RECIPIENT });
       }
       await batch.commit();
+      if (insuranceNotification) {
+        // Fire-and-forget: a Resend failure must never block or roll back the
+        // payment/notification writes that already committed above.
+        sendEmail({ data: { to: INSURANCE_TEST_RECIPIENT, subject: insuranceNotification.subject, text: insuranceNotification.body } })
+          .then((r) => { if (!r.ok) console.warn("[insurance email] not delivered:", r.error); })
+          .catch((err) => console.warn("[insurance email] request failed:", err));
+      }
       setSaving(false);
       setAmount(""); setMpesaRef(""); setInsNum(""); setErrs({});
       onDone(
         method === "MPesa"
           ? `M-Pesa payment confirmed: ${receipt_number} (Ref: ${docPayload.mpesa_reference})`
           : method === "Insurance"
-            ? `Insurance claim queued: ${receipt_number}. Await provider approval before service.`
+            ? `Insurance claim queued: ${receipt_number}. Email sent — await auto/manual approval before service.`
             : `Payment recorded: ${receipt_number}`,
         method === "MPesa" ? { payment: { id: paymentRef.id, ...docPayload } as Payment, patient } : undefined,
       );
@@ -552,7 +671,7 @@ function PaymentModal({ open, onClose, patient, visit, staffId, staffName, onDon
   };
 
   return (
-    <Modal open={open} onClose={onClose} title="Process Payment">
+    <Modal open={open} onClose={onClose} title={existingPayment ? `Settle ${purposeOf(existingPayment)} Payment` : "Process Payment"}>
       <div className="space-y-4">
         <div className="rounded-md bg-muted/40 p-3 text-sm">
           <div><span className="text-muted-foreground">Patient:</span> {patient.first_name} {patient.last_name}</div>
@@ -652,7 +771,7 @@ function MpesaReceiptModal({ open, onClose, payment, patient, staffName }: { ope
             <tr><td className="text-muted-foreground">M-Pesa Reference</td><td className="font-mono">{payment.mpesa_reference}</td></tr>
             <tr><td className="text-muted-foreground">Phone Number</td><td>{payment.phone_number}</td></tr>
             <tr><td className="text-muted-foreground">Amount Paid</td><td>KES {Number(payment.amount).toLocaleString()}</td></tr>
-            <tr><td className="text-muted-foreground">Date &amp; Time</td><td>{new Date(payment.processed_at).toLocaleString()}</td></tr>
+            <tr><td className="text-muted-foreground">Date &amp; Time</td><td>{payment.processed_at ? new Date(payment.processed_at).toLocaleString() : "—"}</td></tr>
             <tr><td className="text-muted-foreground">Processed By</td><td>{staffName || payment.processed_by}</td></tr>
           </tbody>
         </table>
