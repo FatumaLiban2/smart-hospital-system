@@ -2,7 +2,7 @@ import { type ReactNode, useEffect, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { LogOut, Activity, Loader2 } from "lucide-react";
 import { useAuth, type StaffRole } from "@/context/AuthContext";
-import { usePatientData } from "@/context/PatientDataContext";
+import { usePatientData, VISIT_STATUSES } from "@/context/PatientDataContext";
 
 export function ageFromDob(dob: string) {
   const d = new Date(dob);
@@ -14,7 +14,7 @@ export function todayISO() {
   return new Date().toISOString().slice(0, 10);
 }
 
-export function isToday(iso: string) {
+export function isToday(iso: string | null | undefined) {
   return iso?.slice(0, 10) === todayISO();
 }
 
@@ -64,8 +64,6 @@ export function RoleHeader({ title, accent }: { title: string; accent: string })
   );
 }
 
-const FLOW = ["Waiting","Awaiting Insurance Approval","Waiting for Triage","In Triage","Waiting for Consultation","In Consultation","In Lab","Waiting for Pharmacy","In Pharmacy","Discharged"];
-
 export function FlowTracker() {
   const { visits } = usePatientData();
   const today = todayISO();
@@ -75,8 +73,8 @@ export function FlowTracker() {
       <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground">
         <Activity className="size-4" /> Live Patient Flow — Today
       </div>
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-9">
-        {FLOW.map((status) => {
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-7">
+        {VISIT_STATUSES.map((status) => {
           const count = todays.filter((v) => v.status === status).length;
           return (
             <div key={status} className="rounded-md bg-muted/50 px-3 py-2 text-center">

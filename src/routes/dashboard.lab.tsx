@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { addDoc, collection, doc, updateDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/context/AuthContext";
@@ -20,13 +20,16 @@ function isLabRequestCompleted(request: LabRequest) {
 
 function Dashboard() {
   const { staff } = useAuth();
-  const { patients, labRequests, labResults, triageRecords } = usePatientData();
+  const { patients, visits, labRequests, labResults, triageRecords } = usePatientData();
   const { toast, ui } = useToast();
   const [tab, setTab] = useState<Tab>("queue");
   const [activeReq, setActiveReq] = useState<string | null>(null);
 
-  const pending = labRequests.filter((r) => isLabRequestPending(r) && r.status !== "In Progress");
-  const inProgress = labRequests.filter((r) => r.status === "In Progress" || r.lab_status === "in-progress");
+  // Only bench requests whose visit has cleared its Lab payment (visit status
+  // "In Lab") show up here — mirrors the payment gate every other stage uses.
+  const billedVisitIds = useMemo(() => new Set(visits.filter((v) => v.status === "In Lab").map((v) => v.id)), [visits]);
+  const pending = labRequests.filter((r) => isLabRequestPending(r) && r.status !== "In Progress" && billedVisitIds.has(r.visit_id));
+  const inProgress = labRequests.filter((r) => (r.status === "In Progress" || r.lab_status === "in-progress") && billedVisitIds.has(r.visit_id));
   const pendingRequests = [...pending, ...inProgress];
   const completedToday = labResults.filter((r) => isToday(r.uploaded_at)).length;
 
@@ -88,7 +91,7 @@ function Dashboard() {
     const [saving, setSaving] = useState(false);
 
     if (!req || !patient) {
-      const choices = labRequests.filter((r) => r.status === "In Progress" || r.status === "Pending" || r.lab_status === "in-progress" || r.lab_status === "pending" || r.results_received === false);
+      const choices = labRequests.filter((r) => billedVisitIds.has(r.visit_id) && (r.status === "In Progress" || r.status === "Pending" || r.lab_status === "in-progress" || r.lab_status === "pending" || r.results_received === false));
       return (
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">Pick a lab request:</p>
@@ -128,7 +131,7 @@ function Dashboard() {
         const visitLabRequests = labRequests.filter((r) => r.visit_id === req.visit_id && r.id !== req.id);
         const allDone = [...visitLabRequests, { ...req, status: "Completed", lab_status: "completed", results_received: true }].every((r) => isLabRequestCompleted(r));
         if (allDone) {
-          await updateDoc(doc(db, "visits", req.visit_id), { status: "Waiting for Pharmacy", lab_returned_at: new Date().toISOString() });
+          await updateDoc(doc(db, "visits", req.visit_id), { status: "In Consultation", lab_returned_at: new Date().toISOString() });
         }
         setSaving(false);
         toast.success("Results uploaded" + (allDone ? " — patient returned to clinician review" : ""));

@@ -4,7 +4,7 @@ import { addDoc, collection, doc, updateDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/context/AuthContext";
 import { usePatientData } from "@/context/PatientDataContext";
-import { canProceedToService } from "@/lib/firestore-helpers";
+import { canProceedToService, purposePaymentByVisit } from "@/lib/firestore-helpers";
 import { RoleGuard, RoleHeader, FlowTracker, StatCard, Tabs, Empty, Spinner, Field, inputCls, useToast, isToday, ageFromDob } from "@/components/his/shared";
 
 export const Route = createFileRoute("/dashboard/triage")({ component: () => <RoleGuard role="TriageNurse"><Dashboard /></RoleGuard> });
@@ -28,7 +28,7 @@ function Dashboard() {
   const queue = useMemo(() => visits.filter((v) => {
     if (v.status !== "Waiting for Triage") return false;
     const patient = patients.find((p) => p.id === v.patient_id);
-    const payment = payments.find((p) => p.visit_id === v.id);
+    const payment = purposePaymentByVisit(payments, v.id, "Registration");
     return canProceedToService(payment, patient?.insurance_number);
   }), [patients, payments, visits]);
   const completedToday = triageRecords.filter((t) => isToday(t.recorded_at)).length;
@@ -60,7 +60,7 @@ function Dashboard() {
                         <td className="px-3 py-2">{p.visit_reason}</td>
                         <td className="px-3 py-2">{new Date(v.visit_date).toLocaleTimeString()}</td>
                         <td className="px-3 py-2"><button onClick={() => {
-                          const payment = payments.find((py) => py.visit_id === v.id);
+                          const payment = purposePaymentByVisit(payments, v.id, "Registration");
                           if (!canProceedToService(payment, p.insurance_number)) {
                             toast.error("Payment must be cleared before triage.");
                             return;
@@ -111,7 +111,7 @@ function Dashboard() {
       required.forEach((k) => { if (!form[k]) next[k] = true; });
       setErrs(next);
       if (Object.keys(next).length) { toast.error("Please fill required fields"); return; }
-      const payment = payments.find((p) => p.visit_id === current.visitId);
+      const payment = purposePaymentByVisit(payments, current.visitId, "Registration");
       if (!canProceedToService(payment, patient.insurance_number)) {
         toast.error("Payment must be cleared before triage.");
         return;
